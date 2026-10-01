@@ -19,8 +19,10 @@ def _config_smtp():
     return {
         "servidor": cfg.get("servidor") or os.getenv("SMTP_SERVIDOR", "smtp.gmail.com"),
         "puerto": int(cfg.get("puerto") or os.getenv("SMTP_PUERTO", 587)),
-        "usuario": cfg.get("usuario") or os.getenv("SMTP_USUARIO", ""),
-        "password": cfg.get("password") or os.getenv("SMTP_PASSWORD", ""),
+        # Quitamos espacios: las "Contraseñas de aplicación" de Google se copian
+        # como "abcd efgh ijkl mnop" y los espacios rompen la autenticación.
+        "usuario": (cfg.get("usuario") or os.getenv("SMTP_USUARIO", "")).strip(),
+        "password": (cfg.get("password") or os.getenv("SMTP_PASSWORD", "")).replace(" ", "").strip(),
         "remitente": cfg.get("remitente") or "INGENIERÍA Y SUMINISTROS J&M S.A.S.",
     }
 
@@ -85,6 +87,38 @@ def _construir_mensaje(cfg, nombre, correo, cap, adjunto):
     return msg
 
 
+def _conectar(cfg, modo):
+    """modo: 'starttls' (587) o 'ssl' (465)."""
+    if modo == "ssl":
+        servidor = smtplib.SMTP_SSL(cfg["servidor"], 465, timeout=20)
+    else:
+        servidor = smtplib.SMTP(cfg["servidor"], cfg["puerto"] or 587, timeout=20)
+        servidor.ehlo()
+        servidor.starttls()
+        servidor.ehlo()
+    servidor.login(cfg["usuario"], cfg["password"])
+    return servidor
+
+
+def _mensaje_amigable(error: Exception) -> str:
+    txt = str(error)
+    if isinstance(error, smtplib.SMTPAuthenticationError) or "Username and Password not accepted" in txt:
+        return (
+            "Gmail rechazó el usuario/contraseña. Debes usar una **Contraseña de aplicación** de 16 "
+            "caracteres (no la contraseña normal de la cuenta). Genera una en "
+            "https://myaccount.google.com/apppasswords (requiere verificación en 2 pasos activada) "
+            "y pégala sin espacios en .streamlit/secrets.toml."
+        )
+    if "Connection unexpectedly closed" in txt or isinstance(error, (smtplib.SMTPServerDisconnected, ConnectionResetError)):
+        return (
+            "El servidor de Gmail cerró la conexión al autenticar. Casi siempre significa que el "
+            "'password' en secrets.toml es la contraseña normal de la cuenta en vez de una "
+            "Contraseña de aplicación de 16 caracteres, o que tiene espacios. Genera una nueva en "
+            "https://myaccount.google.com/apppasswords."
+        )
+    return f"{txt}"
+
+
 def enviar_notificacion_capacitacion(df_destinatarios, cap, ruta_material=None):
     """
     df_destinatarios: DataFrame con columnas 'nombre' y 'correo'
@@ -122,15 +156,23 @@ def enviar_notificacion_capacitacion(df_destinatarios, cap, ruta_material=None):
     if not destinos:
         return resultado
 
-    try:
-        if cfg["puerto"] == 465:
-            servidor = smtplib.SMTP_SSL(cfg["servidor"], 465, timeout=30)
-        else:
-            servidor = smtplib.SMTP(cfg["servidor"], cfg["puerto"], timeout=30)
-            servidor.starttls()
-        servidor.login(cfg["usuario"], cfg["password"])
-    except Exception as e:
-        resultado["error_general"] = f"No se pudo conectar/autenticar con el servidor de correo: {e}"
+    # Intenta primero con el modo configurado (587/STARTTLS por defecto) y,
+    # si falla por conexión, reintenta automáticamente con el otro modo (465/SSL).
+    modo_inicial = "ssl" if cfg["puerto"] == 465 else "starttls"
+    modo_alterno = "starttls" if modo_inicial == "ssl" else "ssl"
+
+    servidor = None
+    ultimo_error = None
+    for modo in (modo_inicial, modo_alterno):
+        try:
+            servidor = _conectar(cfg, modo)
+            break
+        except Exception as e:
+            ultimo_error = e
+            servidor = None
+
+    if servidor is None:
+        resultado["error_general"] = f"No se pudo conectar/autenticar con el servidor de correo: {_mensaje_amigable(ultimo_error)}"
         return resultado
 
     try:
@@ -140,7 +182,7 @@ def enviar_notificacion_capacitacion(df_destinatarios, cap, ruta_material=None):
                 servidor.send_message(msg)
                 resultado["enviados"].append(nombre)
             except Exception as e:
-                resultado["fallidos"].append((nombre, str(e)))
+                resultado["fallidos"].append((nombre, _mensaje_amigable(e)))
     finally:
         try:
             servidor.quit()
